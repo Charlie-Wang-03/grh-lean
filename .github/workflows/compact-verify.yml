@@ -1,0 +1,124 @@
+name: Compact Lean verification
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+        working-directory: grh-compact
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve upstream statement and toolchain baseline
+        working-directory: .
+        run: |
+          git diff --exit-code 72fead102f663d5c7a407964a13dc0cf9d977207 -- \
+            grh-compact/src/Statements.lean grh-compact/Challenge.lean \
+            grh-compact/comparator.json grh-compact/lean-toolchain \
+            grh-compact/lake-manifest.json grh-compact/scripts/PrintAxioms.lean
+      - name: Install Lean and retrieve Mathlib cache
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: grh-compact
+          auto-config: 'false'
+          build: 'false'
+          test: 'false'
+          lint: 'false'
+          use-github-cache: 'false'
+          use-mathlib-cache: 'true'
+      - name: Clean project build
+        run: |
+          set -euo pipefail
+          lean --version
+          free -h
+          df -h .
+          /usr/bin/time -v lake build 2>&1 | tee "$RUNNER_TEMP/compact-build.log"
+          if grep -E "declaration uses 'sorry'" "$RUNNER_TEMP/compact-build.log"; then
+            echo "::error::A compiled source declaration uses sorry"
+            exit 1
+          fi
+      - name: Verify theorem types and axiom dependencies
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/VerifyStatements.lean" <<'LEAN'
+          import Main
+          example : RiemannHypothesis := riemannHypothesis
+          example : RiemannZetaZerosOnLine := riemannZeta_eq_zero_re
+          example : DirichletLNonvanishingRightOfHalf := LFunction_ne_zero_of_half_lt_re
+          example : DirichletLZerosOnLine := LFunction_eq_zero_re
+          example : PrimitiveDirichletLZerosOnLine := LFunction_eq_zero_re_of_isPrimitive
+          LEAN
+          lake env lean "$RUNNER_TEMP/VerifyStatements.lean"
+          lake env lean scripts/PrintAxioms.lean | tee "$RUNNER_TEMP/compact-axioms.log"
+          python3 - "$RUNNER_TEMP/compact-axioms.log" <<'PY'
+          import pathlib, re, sys
+          expected = {
+              "riemannHypothesis", "riemannZeta_eq_zero_re",
+              "LFunction_ne_zero_of_half_lt_re", "LFunction_eq_zero_re",
+              "LFunction_eq_zero_re_of_isPrimitive",
+          }
+          allowed = {"propext", "Classical.choice", "Quot.sound"}
+          seen = {}
+          for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+              match = re.fullmatch(r"'([^']+)' depends on axioms: \[(.*)\]", line.strip())
+              if match:
+                  name, axioms = match.groups()
+                  if name in seen:
+                      raise SystemExit(f"Duplicate axiom result: {name}")
+                  seen[name] = {a.strip() for a in axioms.split(",") if a.strip()}
+              else:
+                  match = re.fullmatch(r"'([^']+)' does not depend on any axioms", line.strip())
+                  if match:
+                      name = match.group(1)
+                      if name in seen:
+                          raise SystemExit(f"Duplicate axiom result: {name}")
+                      seen[name] = set()
+          if seen.keys() != expected:
+              raise SystemExit(f"Unexpected theorem results: {seen}")
+          for name, axioms in seen.items():
+              if not axioms <= allowed:
+                  raise SystemExit(f"Unapproved axioms for {name}: {axioms - allowed}")
+          print("All five theorem axiom sets satisfy the baseline allowlist.")
+          PY
+      - name: Record source size (raw, not the compression metric)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          files = sorted(Path("src").rglob("*.lean"))
+          lines = sum(len(p.read_bytes().splitlines()) for p in files)
+          size = sum(p.stat().st_size for p in files)
+          print(f"Lean files: {len(files)}; physical lines: {lines}; bytes: {size}")
+          PY
+      - name: Replay Main through Lean kernel
+        env:
+          LEAN_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v lake env leanchecker Main 2>&1 | tee "$RUNNER_TEMP/compact-replay.log"
+      - name: Upload verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compact-verification
+          path: |
+            ${{ runner.temp }}/compact-build.log
+            ${{ runner.temp }}/compact-axioms.log
+            ${{ runner.temp }}/compact-replay.log
+          if-no-files-found: warn
+          retention-days: 7
